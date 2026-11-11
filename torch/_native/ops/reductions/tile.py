@@ -54,6 +54,10 @@ def _ilog2(n: int) -> int:
     return n.bit_length() - 1
 
 
+def _trailing_zeros(n: int) -> int:
+    return (n & -n).bit_length() - 1
+
+
 def _off(base, i: int):
     # Keep a static base static (see TileMap.col_base): int + int stays foldable.
     return base + i if isinstance(base, int) else base + Int32(i)
@@ -218,6 +222,88 @@ def fold_decoded(
     return reduce_fn(acc, val, base_r, valid)
 
 
+# Caps the loads fold_uniform_tree unrolls per thread; each adds a load and its merges.
+# On B200 one kernel compiles in 0.24-0.31 s (64 loads: 0.31 s vs 0.25 s for the online
+# chain), and a configuration can compile up to 127 kernels (whole loads x tail).
+UNIFORM_TREE_MAX_LOADS = 64
+
+
+def _uniform_tree_issue(
+    trait,
+    count,
+    threads_per_block,
+    npairs_red,
+    *,
+    axis,
+    order,
+    combine,
+    gidx_from,
+    flat_tail,
+    ragged_chunk,
+) -> str | None:
+    # The tree indexes one run with Int32 r, which the load cap keeps in range. It bounds
+    # the tail by the unclamped rb (no flat_tail or ragged_chunk clamp), and masked lanes
+    # read obase rather than in_base, which only overhanging chunks need.
+    max_count = threads_per_block * UNIFORM_TREE_MAX_LOADS
+    if axis != "general" or order != "linear":
+        return f"a linear general-axis fold, got {axis=} {order=}"
+    if combine:
+        return "a fold of inputs, not partials"
+    if gidx_from != "r":
+        return f"indices from r, got {gidx_from=}"
+    if not getattr(trait, "has_combine_equal", False):
+        return f"a trait with has_combine_equal, got {type(trait).__name__}"
+    if npairs_red != 1:
+        return f"one reduced run, got {npairs_red}"
+    if flat_tail or ragged_chunk:
+        return f"an unclamped run, got {flat_tail=} {ragged_chunk=}"
+    if not threads_per_block <= count <= max_count:
+        return f"{threads_per_block} to {max_count} values per output for {threads_per_block} threads, got {count}"
+    return None
+
+
+@cute.jit
+def fold_uniform_tree(
+    trait,
+    mX,
+    obase,
+    rstrides,
+    threads_per_block: cutlass.Constexpr,
+    tidx,
+    nloads: cutlass.Constexpr,
+    tail: cutlass.Constexpr,
+    count,
+):
+    """Fold each thread's nloads loads as equal-count Welford trees, then the masked tail
+    load when `tail`. Only nloads and `tail` are compiled: with T = threads_per_block, a
+    tail kernel serves every count strictly between nloads * T and (nloads + 1) * T, and
+    an exact multiple of T gets its own tail-free kernel."""
+    tree = []
+    stride = rstrides[0]
+    for load in cutlass.range_constexpr(nloads):
+        r = tidx + Int32(const_expr(load * threads_per_block))
+        carry = trait.leaf(trait.acc(mX[obase + Int64(r) * stride]), r)
+        width = 1
+        merges = _trailing_zeros(load + 1)
+        # Not _streaming_push: combine_equal takes each level's width.
+        for _ in cutlass.range_constexpr(merges):
+            carry = trait.combine_equal(tree.pop(), carry, const_expr(width))
+            width *= 2
+        tree.append(carry)
+    acc = _linear_reduce(tree, trait.combine)
+    if const_expr(tail):
+        r = Int32(const_expr(nloads * threads_per_block)) + tidx
+        valid = r < count
+        safe = r if valid else Int32(0)
+        leaf = trait.leaf(trait.acc(mX[obase + Int64(safe) * stride]), safe)
+        # Not trait.reduce: tree folds merge leaves via combine, not the online update.
+        merged = trait.combine(acc, leaf)
+        acc = tuple(
+            merged[f] if valid else acc[f] for f in range(const_expr(trait.nfields))
+        )
+    return acc
+
+
 @cute.jit
 def fold_partials_run(
     trait, mIns, obase, rb, threads_per_block: cutlass.Constexpr, tidx, in_base
@@ -292,9 +378,8 @@ def _reduce_vec(vals, vec, op):
 def _streaming_push(tree, val, load: int, max_depth: int, op) -> None:
     # Match ATen: merge trailing_zeros(load + 1), capped at max_depth, with
     # the existing accumulator on the left.
-    trailing_zeros = ((load + 1) & -(load + 1)).bit_length() - 1
     carry = val
-    for _ in range(min(trailing_zeros, max_depth)):
+    for _ in range(min(_trailing_zeros(load + 1), max_depth)):
         carry = op(tree.pop(), carry)
     tree.append(carry)
 
@@ -656,11 +741,32 @@ class TileReduce:
         # Duck-typed because its driver-owned type would invert the dependency.
         itree: Any = None,
         ragged_vector=False,
+        # Values per output for the general-axis uniform Welford tree; None disables it.
+        # Whole loads are unmasked, so with T = threads_per_block and loads = count // T
+        # the runtime chunk count must fall in the same bucket: strictly between
+        # loads * T and (loads + 1) * T with a tail, exactly loads * T without one.
+        # ReduceBlock keeps the two consistent.
+        uniform_tree_count: int | None = None,
     ) -> None:
         if axis not in ("row", "col", "general"):
             raise ValueError(f"axis must be 'row', 'col' or 'general', got {axis!r}")
         if order not in ("linear", "inner_tree"):
             raise ValueError(f"order must be 'linear' or 'inner_tree', got {order!r}")
+        if uniform_tree_count is not None:
+            issue = _uniform_tree_issue(
+                trait,
+                uniform_tree_count,
+                threads_per_block,
+                npairs_red,
+                axis=axis,
+                order=order,
+                combine=combine,
+                gidx_from=gidx_from,
+                flat_tail=flat_tail,
+                ragged_chunk=ragged_chunk,
+            )
+            if issue is not None:
+                raise ValueError(f"the uniform Welford tree needs {issue}")
         itemsize = dtype.width // 8 if dtype is not None else 0
         if ragged_vector:
             if axis != "row":
@@ -730,6 +836,10 @@ class TileReduce:
         self.final = final
         self.unroll = unroll
         self.ragged_vector = ragged_vector
+        # The count compiles as whole loads and whether a tail remains.
+        tree_count = uniform_tree_count or 0
+        self.uniform_tree_loads, tail = divmod(tree_count, threads_per_block)
+        self.uniform_tree_tail = bool(tail)
         self.use_tma = use_tma
         self.combine = combine
         self.batched_col = batched_col
@@ -792,8 +902,9 @@ class TileReduce:
 
     @property
     def cache_sig(self) -> tuple[Any, ...]:
-        # TMA (static box) and ragged vectors (static row edges) key N; other runtime
-        # paths share a vector class.
+        # TMA (static box) and ragged vectors (static row edges) key N, the uniform tree
+        # its whole-load count and a tail flag, and fixed DAGs their N; other paths share
+        # a vector class.
         return (
             self.axis,
             self.vec,
@@ -818,6 +929,8 @@ class TileReduce:
             self.flat_tail,
             self.ragged_chunk,
             self.ragged_vector,
+            self.uniform_tree_loads,
+            self.uniform_tree_tail,
             self.order,
             # Fixed DAGs key on N, requiring one kernel per shape instead of per vec class.
             self.itree.sig if self.itree is not None else None,
@@ -1641,6 +1754,20 @@ class TileReduce:
                         const_expr(self.threads_per_block),
                         Int64(lane) if const_expr(self.wide_count) else lane,
                         in_base,
+                    ),
+                )
+            elif const_expr(self.uniform_tree_loads):
+                accs = (
+                    fold_uniform_tree(
+                        trait,
+                        mIns[0],
+                        obase,
+                        rstrides,
+                        const_expr(self.threads_per_block),
+                        lane,
+                        const_expr(self.uniform_tree_loads),
+                        const_expr(self.uniform_tree_tail),
+                        rb,
                     ),
                 )
             else:
