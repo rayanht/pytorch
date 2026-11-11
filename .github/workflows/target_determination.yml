@@ -86,6 +86,7 @@ jobs:
           JOB_ID: ${{ steps.get-job-id.outputs.job-id }}
           JOB_NAME: ${{ steps.get-job-id.outputs.job-name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          TD_SCORER_MODEL_FILE: tools/testing/target_determination/td-scorer-pr-test.json
         run: |
           unzip -o .additional_ci_files/llm_results/mappings.zip -d .additional_ci_files/llm_results || true
           # Dependencies are declared inline in the script via PEP 723.

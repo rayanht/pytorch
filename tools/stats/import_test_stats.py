@@ -157,6 +157,10 @@ def get_td_heuristic_profiling_json() -> dict[str, Any]:
 
 def get_td_scorer(max_bytes: int) -> bytes | None:
     """Raw bytes of the TD scorer model, at most max_bytes + 1 of them, or None."""
+    test_model = os.environ.get("TD_SCORER_MODEL_FILE")
+    if test_model:
+        print(f"TD scorer: test model {test_model}")
+        return (REPO_ROOT / test_model).read_bytes()[: max_bytes + 1]
     url = f"{GENERATED_STATS_URL}/td-scorer.json"
     print(f"Downloading {url}")
     for _ in range(3):
