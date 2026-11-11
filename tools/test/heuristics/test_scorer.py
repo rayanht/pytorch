@@ -699,7 +699,7 @@ class TestScorerCut(unittest.TestCase):
         self.include, self.exclude = td_cut(
             ["a", "b", "c", "d", "e"], {"e": 1.0, "d": 0.5}
         )
-        times = dict.fromkeys("abcde", 5.0)
+        times: dict[str, float] = dict.fromkeys("abcde", 5.0)
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "td_results.json"
             if block is not None:
