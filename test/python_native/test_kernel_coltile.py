@@ -807,6 +807,20 @@ class TestOrderedColRoute(TestCase):
         with self.assertRaisesRegex(ValueError, "tile_columns must be one of"):
             ct.reduce_ordered_col(trait, "bad", x, [torch.float32], 1, config=bad)
 
+    def test_policy_table_mappings(self):
+        """Keep every table entry a mapping the kernel accepts."""
+        self.assertTrue(ct._ORDERED_COL_CONFIGS)
+        for cc, configs in ct._ORDERED_COL_CONFIGS.items():
+            for trait_type, cfg in configs.items():
+                with self.subTest(cc=cc, trait=trait_type.__name__):
+                    ct._check_ordered_mapping(cfg.worker_warps, cfg.tile_columns)
+                    self.assertGreaterEqual(cfg.min_blocks, 0)
+                    self.assertIsInstance(cfg.full_tiles, bool)
+                    outs = cfg.out_dtypes
+                    if outs is not None:
+                        self.assertTrue(outs)
+                        self.assertTrue(all(isinstance(d, torch.dtype) for d in outs))
+
     def test_row_offsets_widen_past_int32(self):
         from torch._native.ops.reductions import kernel_rowtile as rt
 
@@ -856,8 +870,12 @@ class TestOrderedColRoute(TestCase):
         measured = cfg._replace(out_dtypes=(bf16,))
         table = {(9, 0): {T.SumOps: cfg, T.WelfordOps: cfg, T.AMaxOps: measured}}
 
-        def select(op=T.SumOps, dtype=f32, columns=64, batches=1, **kwargs):
-            contract = dict(nfields=1, acc_bits=32, out_dtypes=(f32,)) | kwargs
+        def select(trait=None, dtype=f32, columns=64, batches=1, **kwargs):
+            trait = T.SumOps() if trait is None else trait
+            op, nouts = type(trait), getattr(trait, "nouts", 1)
+            welford = T.welford_outputs(trait)
+            structure = dict(nfields=trait.nfields, nouts=nouts, welford_outs=welford)
+            contract = structure | dict(acc_bits=32, out_dtypes=(f32,)) | kwargs
             partials = contract.pop("partials", 2)
             return ct.select_ordered_col_config(
                 (9, 0), dtype, columns, batches, partials, trait_type=op, **contract
@@ -868,12 +886,14 @@ class TestOrderedColRoute(TestCase):
             for dtype in (f32, bf16, torch.float16):
                 for out in (f32, dtype):
                     self.assertEqual(select(dtype=dtype, out_dtypes=(out,)), cfg)
-            self.assertEqual(select(T.WelfordOps, bf16), cfg)
+            self.assertEqual(select(T.WelfordOps(), bf16), cfg)
+            # WelfordOps entries serve var and std, not mean-returning traits.
+            self.assertIsNone(select(T.WelfordOps(return_mean=True), bf16))
             # Entries with out_dtypes apply only to those outputs.
-            self.assertEqual(select(T.AMaxOps, bf16, out_dtypes=(bf16,)), measured)
-            self.assertIsNone(select(T.AMaxOps, bf16))
-            self.assertIsNone(select(T.AMaxOps, bf16, out_dtypes=(bf16, bf16)))
-            self.assertIsNone(select(T.MeanOps))
+            self.assertEqual(select(T.AMaxOps(), bf16, out_dtypes=(bf16,)), measured)
+            self.assertIsNone(select(T.AMaxOps(), bf16))
+            self.assertIsNone(select(T.AMaxOps(), bf16, out_dtypes=(bf16, bf16)))
+            self.assertIsNone(select(T.MeanOps()))
             self.assertIsNone(select(dtype=torch.float64))
             self.assertIsNone(select(batches=2))
             self.assertIsNone(select(acc_bits=64))
@@ -1346,6 +1366,8 @@ class TestOrderedColDevice(TestCase):
             plan.split[0],
             trait_type=T.SumOps,
             nfields=1,
+            nouts=1,
+            welford_outs=0,
             acc_bits=32,
             out_dtypes=tuple(outputs),
             rows=rows,
@@ -1368,6 +1390,44 @@ class TestOrderedColDevice(TestCase):
         ops = [_ordered_fields(k) for k in ct._CACHE if k[:2] == tags]
         mapped = {(f["tile_columns"], f["full_tiles"]) for f in ops}
         self.assertEqual(mapped, {(32, False)})
+
+    @parametrize(
+        "key,dtype,rows,cols,width",
+        [
+            ("var0", torch.float32, 65536, 1024, 16),
+            ("var0", torch.bfloat16, 32768, 256, 16),
+            ("argmaxi32", torch.float32, 65536, 256, 16),
+            ("var0", torch.bfloat16, 8192, 1024, 16),
+            # The 2 GiB C = 4096 view select_col_config hands off.
+            ("argmaxi32", torch.bfloat16, 262144, 4096, 32),
+        ],
+        name_fn=lambda key, dt, r, c, w: f"{key}_{str(dt)[6:]}_{r}x{c}",
+    )
+    @largeTensorTest("4GB", device="cuda")
+    def test_sm107_mappings_match_the_indexed_tree(
+        self, device, key, dtype, rows, cols, width
+    ):
+        """Run SM107's ordered mappings (on SM107 or B200) bitwise equal to the indexed
+        tree."""
+        if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 7)):
+            self.skipTest("SM107 mappings are run on SM107 and B200 only")
+        x = torch.randn(rows, cols, device=device, dtype=dtype)
+        if key == "var0":
+            trait, outputs = T.WelfordOps(correction=0), [dtype]
+        else:
+            trait, outputs = T.ArgMaxOps(), [torch.int64]
+        for k in [k for k in ct._CACHE if k[1:3] == (key, dtype)]:
+            del ct._CACHE[k]
+        got = ct.reduce_ordered_col(trait, key, x, outputs, 1, cc=(10, 7))
+        self.assertIsNotNone(got)
+        ops = [_ordered_fields(k) for k in ct._CACHE if k[1:3] == (key, dtype)]
+        mapped = {(f["workers"], f["tile_columns"], f["full_tiles"]) for f in ops}
+        self.assertEqual(mapped, {(16, width, True)})
+        want = kg._try_indexed_itree(
+            trait, key + "_ref", x, [(rows, cols)], [(cols, 1)], cols, rows, outputs, 1
+        )
+        self.assertIsNotNone(want)
+        self._assert_bitwise(got, want)
 
     @parametrize(
         "op,in_dtype,rows,cols,workers,width,start,split,full,used",
@@ -1518,6 +1578,8 @@ class TestOrderedColDevice(TestCase):
                     plan.split[0],
                     trait_type=T.MeanOps,
                     nfields=mean.nfields,
+                    nouts=1,
+                    welford_outs=0,
                     acc_bits=32,
                     out_dtypes=tuple(f32),
                     rows=rows,
