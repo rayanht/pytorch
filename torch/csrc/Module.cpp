@@ -3036,7 +3036,8 @@ Call this whenever a new thread is created in order to propagate values from
       py_module, "_CppFakeTensorMode")
       .def(
           py::init([](const py::object& converter,
-                      const py::object& shape_env) {
+                      const py::object& shape_env,
+                      const py::object& creation_traceback) {
             TORCH_CHECK(!converter.is_none(), "Expected a FakeTensorConverter");
             std::shared_ptr<c10::SafePyObject> shape_env_obj;
             if (!shape_env.is_none()) {
@@ -3053,10 +3054,15 @@ Call this whenever a new thread is created in order to propagate values from
                 functorch_config
                     .attr("fake_tensor_allow_unsafe_data_ptr_access")
                     .cast<bool>());
+            if (!creation_traceback.is_none()) {
+              mode->creation_traceback_ = std::make_shared<c10::SafePyObject>(
+                  creation_traceback.inc_ref().ptr(), getPyInterpreter());
+            }
             return mode;
           }),
           py::arg("converter"),
-          py::arg("shape_env"))
+          py::arg("shape_env"),
+          py::arg("creation_traceback") = py::none())
       // Adopts an existing mode, to rebuild its collected Python object; see
       // Note [C++ FakeTensorMode Python object lifetime]
       .def(py::init(&torch::fake_tensor::cpp_fake_mode_from_capsule))
@@ -3077,6 +3083,15 @@ Call this whenever a new thread is created in order to propagate values from
                 mode->fake_mode_pyobj_ == nullptr,
                 "This C++ FakeTensorMode already has a Python object");
             mode->fake_mode_pyobj_ = std::move(obj);
+          })
+      .def_property_readonly(
+          "_creation_traceback",
+          [](const c10::FakeTensorMode& mode) -> py::object {
+            if (!mode.creation_traceback_) {
+              return py::none();
+            }
+            return py::reinterpret_borrow<py::object>(
+                mode.creation_traceback_->ptr(getPyInterpreter()));
           })
       .def_property(
           "allow_meta",
