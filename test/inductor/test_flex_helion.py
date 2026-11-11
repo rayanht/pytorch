@@ -294,6 +294,64 @@ class TestFlexHelion(InductorTestCase):
         self.assertEqual(kernel_autotune.call_count, 1)
         get_kernel.assert_called_with("forward", config=dict(found["config"].config))
 
+    def test_user_configs(self):
+        # HELION_FWD_CONFIG / HELION_BWD_CONFIG fix each kernel to the caller's
+        # config with no autotuning, even when Helion's effort would autotune.
+        from helion.runtime.kernel import Kernel
+
+        from torch._inductor.kernel.flex import flex_helion_kernels
+
+        mask = create_block_mask(_causal, None, None, 256, 256, device="cuda")
+        configs = {}
+
+        def default_config(kernel, args, force):
+            config = kernel.bind(args).config_spec.default_config()
+            params = kernel.signature.parameters
+            direction = "backward" if "grad_out" in params else "forward"
+            configs[direction] = dict(config.config)
+            return config
+
+        def run(kernel_options, autotune):
+            torch._dynamo.reset()
+            q, k, v = _tensors(2, 4, 4, 256, 256, 64)
+            with mock.patch.object(
+                Kernel, "autotune", autospec=True
+            ) as kernel_autotune:
+                kernel_autotune.side_effect = autotune
+                out = torch.compile(flex_attention)(
+                    q,
+                    k,
+                    v,
+                    block_mask=mask,
+                    kernel_options={**HELION, **kernel_options},
+                )
+                out.sum().backward()
+            return kernel_autotune.call_count
+
+        def no_autotune(kernel, args, force):
+            raise AssertionError("autotuned despite a user config")
+
+        flex_helion_kernels._kernel.cache_clear()
+        self.addCleanup(flex_helion_kernels._kernel.cache_clear)
+        with mock.patch.dict(os.environ, {"HELION_AUTOTUNE_EFFORT": "quick"}):
+            self.assertEqual(run({}, default_config), 2)
+            self.assertEqual(set(configs), {"forward", "backward"})
+            user = {
+                "HELION_FWD_CONFIG": configs["forward"],
+                "HELION_BWD_CONFIG": configs["backward"],
+            }
+            with mock.patch.object(
+                flex_helion_kernels, "get_kernel", wraps=flex_helion_kernels.get_kernel
+            ) as get_kernel:
+                self.assertEqual(run(user, no_autotune), 0)
+            for direction in ("forward", "backward"):
+                self.assertIn(
+                    mock.call(direction, config=configs[direction]),
+                    get_kernel.call_args_list,
+                )
+            with self.assertRaisesRegex(Exception, "Invalid HELION_FWD_CONFIG"):
+                run({"HELION_FWD_CONFIG": {"not_a_helion_knob": 1}}, no_autotune)
+
     def test_mods_survive_pickling(self):
         # The Helion autotuner's benchmark subprocess loads the kernel args
         # with torch.load, which re-traces each GraphModule mod: the hl.load

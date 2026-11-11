@@ -7,10 +7,11 @@ compiled with Helion's CuTe backend into its fused tcgen05 flash kernels
 as FX GraphModules, which Helion inlines at trace time; Helion lowers each kernel
 call through its own Inductor template lowering.
 
-Configs: each kernel autotunes when compiled, at Helion's autotune effort
-(``HELION_AUTOTUNE_EFFORT``; "none" takes Helion's default config), accepting
-configs within ``kernel_options`` ``HELION_AUTOTUNE_TOLERANCE`` of the default
-config. Helion caches tuned configs on disk.
+Configs: ``kernel_options`` ``HELION_FWD_CONFIG`` / ``HELION_BWD_CONFIG`` fix a
+kernel to the caller's config. Otherwise each kernel autotunes when compiled, at
+Helion's autotune effort (``HELION_AUTOTUNE_EFFORT``; "none" takes Helion's
+default config), accepting configs within ``HELION_AUTOTUNE_TOLERANCE`` of the
+default config. Helion caches tuned configs on disk.
 
 The kernels are compiled for static shapes: the lowering specializes the graph
 to its inputs' sizes, so a call at another shape recompiles.
@@ -436,8 +437,11 @@ def _select_kernel(
     fake_args: tuple[object, ...],
     tuning_args: Callable[[], tuple[object, ...]],
 ) -> Any:
-    """The kernel to lower, fixed to the best config autotuning finds (Helion's
-    default config at ``HELION_AUTOTUNE_EFFORT=none``)."""
+    """The kernel to lower, fixed to the caller's config for ``direction``
+    (``HELION_FWD_CONFIG`` / ``HELION_BWD_CONFIG``) or else to the best config
+    autotuning finds (Helion's default config at ``HELION_AUTOTUNE_EFFORT=none``)."""
+    import helion  # type: ignore[import-not-found]
+
     from . import flex_helion_kernels
 
     tolerance = kernel_options.get(
@@ -462,6 +466,14 @@ def _select_kernel(
             "mask_mod pointwise in the coordinates and captured tensors); "
             f"HELION_LOGS=+helion._compiler.cute.{matcher} logs why"
         )
+    option = "HELION_FWD_CONFIG" if direction == "forward" else "HELION_BWD_CONFIG"
+    config = kernel_options.get(option)
+    if config is not None:
+        try:
+            bound.config_spec.normalized_config(config)
+        except (TypeError, helion.exc.InvalidConfig) as e:
+            raise ValueError(f"Invalid {option}: {e}") from e
+        return flex_helion_kernels.get_kernel(direction, config=dict(config))
     if kernel.settings.autotune_effort == "none":
         return kernel
     config = kernel.autotune(tuning_args(), force=False)

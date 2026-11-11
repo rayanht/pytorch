@@ -337,6 +337,19 @@ class FlexKernelOptions(TypedDict, total=False):
     Default: 0.02
     """
 
+    HELION_FWD_CONFIG: NotRequired[dict[str, Any]]
+    """Helion config for the forward kernel with ``BACKEND="HELION"``.
+
+    A dict of Helion config knobs (for example the config Helion prints after
+    autotuning, as a dict); the forward kernel uses it instead of autotuning.
+    Raises if the config does not apply to the installed Helion. Default: None
+    """
+
+    HELION_BWD_CONFIG: NotRequired[dict[str, Any]]
+    """Helion config for the backward kernel with ``BACKEND="HELION"``; see
+    ``HELION_FWD_CONFIG``. Default: None
+    """
+
 
 class _KernelOptionsWithInternals(FlexKernelOptions, total=False):
     OUTPUT_LOGSUMEXP: bool
