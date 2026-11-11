@@ -3093,6 +3093,7 @@ Call this whenever a new thread is created in order to propagate values from
             return py::reinterpret_borrow<py::object>(
                 mode.creation_traceback_->ptr(getPyInterpreter()));
           })
+      .def_readwrite("static_shapes", &c10::FakeTensorMode::static_shapes_)
       .def_property(
           "allow_meta",
           [](const c10::FakeTensorMode& mode) { return mode.allow_meta_; },
