@@ -158,7 +158,9 @@ class TestKernelRowTile(TestCase):
             trait, "smoke_partials", x, [torch.float32] * trait.nfields, final=False
         )
         self.assertEqual(len(parts), trait.nfields)
-        torch.testing.assert_close(parts[0], x.mean(dim=1), atol=1e-5, rtol=1e-5)
+        with torch.backends.python_native.cutedsl.disabled():
+            want = x.mean(dim=1)
+        torch.testing.assert_close(parts[0], want, atol=1e-5, rtol=1e-5)
         self.assertEqual(parts[2], torch.full((32,), 256.0, device="cuda"))
 
     def test_single_row_config_rungs_are_valid(self):
@@ -291,7 +293,9 @@ class TestKernelRowTile(TestCase):
             threads_per_row=1,
             use_tma=False,
         )
-        torch.testing.assert_close(out, x.sum(dim=1), atol=1e-3, rtol=1e-3)
+        with torch.backends.python_native.cutedsl.disabled():
+            want = x.sum(dim=1)
+        torch.testing.assert_close(out, want, atol=1e-3, rtol=1e-3)
 
     def test_tma_staged_narrow_row_argmax(self):
         # TMA rotates smem reads to avoid bank conflicts; an index trait verifies that
@@ -648,7 +652,9 @@ class TestKernelRowTile(TestCase):
             (got,) = rt.reduce_row_tile(
                 trait, "ragged_width", x, [torch.float32], ragged_vector=True
             )
-            self.assertEqual(got, x.sum(dim=1), atol=0, rtol=0)
+            with torch.backends.python_native.cutedsl.disabled():
+                want = x.sum(dim=1)
+            self.assertEqual(got, want, atol=0, rtol=0)
         mine = [k for k in rt._CACHE if "ragged_width" in k]
         self.assertEqual(len(mine), 2, f"expected one plan per width, got {mine}")
         # Whole-vector widths fall back to the rolled path's one plan per vector class.
@@ -657,7 +663,9 @@ class TestKernelRowTile(TestCase):
             (got,) = rt.reduce_row_tile(
                 trait, "ragged_whole", x, [torch.float32], ragged_vector=True
             )
-            self.assertEqual(got, x.sum(dim=1), atol=0, rtol=0)
+            with torch.backends.python_native.cutedsl.disabled():
+                want = x.sum(dim=1)
+            self.assertEqual(got, want, atol=0, rtol=0)
         mine = [k for k in rt._CACHE if "ragged_whole" in k]
         self.assertEqual(len(mine), 1, f"expected one plan per vec class, got {mine}")
 
