@@ -400,6 +400,9 @@ def maybe_set_real_tensor(x: object, real: Tensor | None) -> None:
             torch._C._set_real_tensor(x, real)
 
 
+# The item memo of a fake. A C++ fake keeps it on the C++ tensor, which like
+# SymNumberMemoDescriptor drops it once the tensor is mutated or fake_mode's
+# epoch changes, except that a backed SymFloat is kept across epochs.
 def maybe_get_item_memo(x: object) -> _ItemMemo | None:
     if isinstance(x, FakeTensor):  # noqa: ISINSTANCE_FAKE_TENSOR
         return x.item_memo
@@ -975,6 +978,26 @@ def _from_tensor_shape_env(
             raise AssertionError("cannot set both static_shapes and symbolic_context")
         shape_env = None
     return shape_env
+
+
+@typing.final
+class CppFakeTensorMode(torch._C._CppFakeTensorMode):
+    # State belongs to C++; a collected wrapper can be recreated around it.
+    # See Note [C++ FakeTensorMode Python object lifetime].
+    __slots__ = ()
+
+    def __init__(self, *, shape_env: ShapeEnv | None = None) -> None:
+        import torch._functorch.config
+
+        copy_data = torch._functorch.config.fake_tensor_propagate_real_tensors
+        super().__init__(FakeTensorConverter(copy_data=copy_data), shape_env)
+        self._attach_python_object()
+
+    @classmethod
+    def _from_cpp_mode(cls, cpp_mode: object) -> Self:
+        self = cls.__new__(cls)
+        torch._C._CppFakeTensorMode.__init__(self, cpp_mode)
+        return self
 
 
 @functools.cache
